@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
+use super::network::open_tap::open_tap;
+use super::network::tap::Tap;
 use crate::core::cpu::{self, cpuid, mptable, Vcpu};
 use crate::core::devices::serial::LumperSerial;
 use crate::core::epoll_context::{EpollContext, EPOLL_EVENTS_LEN};
 use crate::core::kernel;
 use crate::core::{Error, Result};
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
+
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::KernelLoaderResult;
 use std::io;
@@ -16,11 +19,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::info;
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::terminal::Terminal;
-
-use super::network::open_tap::open_tap;
-use super::network::tap::Tap;
 
 pub struct VMM {
     vm_fd: VmFd,
@@ -28,7 +28,6 @@ pub struct VMM {
     guest_memory: GuestMemoryMmap,
     vcpus: Vec<Vcpu>,
     _tap: Tap,
-
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
 }
@@ -42,10 +41,8 @@ impl VMM {
         // Create a KVM VM object.
         // KVM returns a file descriptor to the VM object.
         let vm_fd = kvm.create_vm().map_err(Error::KvmIoctl)?;
-
         let epoll = EpollContext::new().map_err(Error::EpollError)?;
         epoll.add_stdin().map_err(Error::EpollError)?;
-
         let tap = open_tap(
             None,
             Some(tap_ip_addr),
@@ -71,13 +68,15 @@ impl VMM {
         Ok(vmm)
     }
 
-    fn configure_memory(&mut self, mem_size_mb: u32) -> Result<()> {
+    fn configure_memory(&mut self, mem_size_mb: u32, file: &Vec<u8>) -> Result<()> {
         // Convert memory size from MBytes to bytes.
         let mem_size = ((mem_size_mb as u64) << 20) as usize;
+        let file_size = (file.len() + 0x1000) & !(0xFFFusize);
 
-        // Create one single memory region, from zero to mem_size.
-        let mem_regions = vec![(GuestAddress(0), mem_size)];
+        // Create one single memory region, from zero to mem_size + file_size gave by the user.
+        let mem_regions = vec![(GuestAddress(0), mem_size + file_size)];
 
+        println!("memory_region = {:?}", mem_regions);
         // Allocate the guest memory from the memory region.
         let guest_memory = GuestMemoryMmap::from_ranges(&mem_regions).map_err(Error::Memory)?;
 
@@ -89,6 +88,7 @@ impl VMM {
                 slot: index as u32,
                 guest_phys_addr: region.start_addr().raw_value(),
                 memory_size: region.len(),
+
                 // It's safe to unwrap because the guest address is valid.
                 userspace_addr: guest_memory.get_host_address(region.start_addr()).unwrap() as u64,
                 flags: 0,
@@ -101,6 +101,12 @@ impl VMM {
 
         self.guest_memory = guest_memory;
 
+        // Write the file to the guest memory.
+        self.guest_memory
+            .write_slice(file.as_slice(), GuestAddress((mem_size + 1) as u64))
+            .expect("Failed to write file to guest memory");
+
+        println!("file_write at = {:?}", GuestAddress((mem_size + 1) as u64));
         Ok(())
     }
 
@@ -142,12 +148,14 @@ impl VMM {
 
             // Set CPUID.
             let mut vcpu_cpuid = base_cpuid.clone();
+
             cpuid::filter_cpuid(
                 &self.kvm,
                 index as usize,
                 num_vcpus as usize,
                 &mut vcpu_cpuid,
             );
+
             vcpu.configure_cpuid(&vcpu_cpuid).map_err(Error::Vcpu)?;
 
             // Configure MSRs (model specific registers).
@@ -156,13 +164,14 @@ impl VMM {
             // Configure regs, sregs and fpu.
             vcpu.configure_regs(kernel_load.kernel_load)
                 .map_err(Error::Vcpu)?;
+
             vcpu.configure_sregs(&self.guest_memory)
                 .map_err(Error::Vcpu)?;
+
             vcpu.configure_fpu().map_err(Error::Vcpu)?;
 
             // Configure LAPICs.
             vcpu.configure_lapic().map_err(Error::Vcpu)?;
-
             self.vcpus.push(vcpu);
         }
 
@@ -170,9 +179,11 @@ impl VMM {
     }
 
     /// Run all virtual CPUs.
+
     pub fn run(&mut self) -> Result<()> {
         for mut vcpu in self.vcpus.drain(..) {
             info!(vcpu_index = vcpu.index, "Starting vCPU");
+
             let _ = thread::Builder::new().spawn(move || loop {
                 vcpu.run();
             });
@@ -180,9 +191,11 @@ impl VMM {
 
         let stdin = io::stdin();
         let stdin_lock = stdin.lock();
+
         stdin_lock
             .set_raw_mode()
             .map_err(Error::TerminalConfigure)?;
+
         let mut events = [epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
         let epoll_fd = self.epoll.as_raw_fd();
 
@@ -214,10 +227,25 @@ impl VMM {
     /// * `num_vcpus` Number of virtual CPUs
     /// * `mem_size_mb` Memory size (in MB)
     /// * `kernel_path` Path to a Linux kernel
-    pub fn configure(&mut self, num_vcpus: u8, mem_size_mb: u32, kernel_path: &Path) -> Result<()> {
-        self.configure_memory(mem_size_mb)?;
-        let kernel_load = kernel::kernel_setup(&self.guest_memory, kernel_path.to_path_buf())?;
+    pub fn configure(
+        &mut self,
+        num_vcpus: u8,
+        mem_size_mb: u32,
+        kernel_path: &Path,
+        file_path: &Path,
+    ) -> Result<()> {
+        let file_data = std::fs::read(file_path).map_err(Error::IO)?;
+
+        self.configure_memory(mem_size_mb, &file_data)?;
+
+        let kernel_load = kernel::kernel_setup(
+            &self.guest_memory,
+            kernel_path.to_path_buf(),
+            file_data.len(),
+        )?;
+
         self.configure_io()?;
+
         self.configure_vcpus(num_vcpus, kernel_load)?;
 
         Ok(())

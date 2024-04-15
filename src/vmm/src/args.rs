@@ -9,6 +9,10 @@ use tracing::level_filters;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct CliArguments {
+    /// Path to the file to load in memory.
+    #[arg(short, long, env)]
+    pub file_path: PathBuf,
+
     /// Path to the image of the Linux kernel to boot.
     #[arg(short, long, env)]
     pub kernel: PathBuf,

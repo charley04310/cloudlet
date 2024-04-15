@@ -33,7 +33,7 @@ const EBDA_START: u64 = 0x0009_fc00;
 // TODO: this should be bindgen'ed and exported by linux-loader.
 // See https://github.com/rust-vmm/linux-loader/issues/51
 const E820_RAM: u32 = 1;
-
+const E820_RESERVED: u32 = 1;
 /// Address of the zeropage, where Linux kernel boot parameters are written.
 pub(crate) const ZEROPG_START: u64 = 0x7000;
 
@@ -73,8 +73,10 @@ fn add_e820_entry(
 pub fn build_bootparams(
     guest_memory: &GuestMemoryMmap,
     himem_start: GuestAddress,
+    file_size: usize,
 ) -> std::result::Result<boot_params, Error> {
     let mut params = boot_params::default();
+    let file_size = (file_size + 0x1000) & !(0xFFFusize);
 
     params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
     params.hdr.header = KERNEL_HDR_MAGIC;
@@ -86,15 +88,19 @@ pub fn build_bootparams(
 
     // Add entries for the usable RAM regions.
     let last_addr = guest_memory.last_addr();
+    let himem_size = last_addr
+        .checked_offset_from(himem_start)
+        .ok_or(Error::HimemStartPastMemEnd)?
+        - file_size as u64
+        + 1;
+
+    add_e820_entry(&mut params, himem_start.raw_value(), himem_size, E820_RAM)?;
     add_e820_entry(
         &mut params,
-        himem_start.raw_value(),
-        last_addr
-            .checked_offset_from(himem_start)
-            .ok_or(Error::HimemStartPastMemEnd)?,
-        E820_RAM,
+        himem_start.raw_value() + himem_size,
+        file_size as u64,
+        E820_RESERVED,
     )?;
-
     Ok(params)
 }
 
@@ -107,6 +113,7 @@ pub fn build_bootparams(
 pub fn kernel_setup(
     guest_memory: &GuestMemoryMmap,
     kernel_path: PathBuf,
+    file_size: usize,
 ) -> Result<KernelLoaderResult> {
     let mut kernel_image = File::open(kernel_path).map_err(Error::IO)?;
     let zero_page_addr = GuestAddress(ZEROPG_START);
@@ -116,12 +123,12 @@ pub fn kernel_setup(
         guest_memory,
         None,
         &mut kernel_image,
-        Some(GuestAddress(HIMEM_START)),
+        Some(GuestAddress(HIMEM_START as u64)),
     )
     .map_err(Error::KernelLoad)?;
 
     // Generate boot parameters.
-    let mut bootparams = build_bootparams(guest_memory, GuestAddress(HIMEM_START))?;
+    let mut bootparams = build_bootparams(guest_memory, GuestAddress(HIMEM_START), file_size)?;
 
     // Add the kernel command line to the boot parameters.
     bootparams.hdr.cmd_line_ptr = CMDLINE_START as u32;

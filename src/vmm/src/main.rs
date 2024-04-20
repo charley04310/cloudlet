@@ -12,7 +12,6 @@ pub enum Error {
     VmmRun(core::Error),
 }
 
-/// The application entry point.
 fn main() -> Result<(), Error> {
     // Parse the configuration and configure logger verbosity
     let args = CliArguments::parse();

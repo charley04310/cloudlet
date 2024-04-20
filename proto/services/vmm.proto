@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package vmmorchestrator;
+
+service VmmService {
+  rpc Run (RunVmmRequest) returns (RunVmmResponse);
+}
+
+message RunVmmRequest {
+
+}
+
+message RunVmmResponse {
+}

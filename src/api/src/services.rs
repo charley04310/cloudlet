@@ -1,3 +1,4 @@
+use crate::client::VmmClient;
 use actix_web::{get, post, web, HttpResponse, Responder};
 
 #[post("/configuration")]
@@ -8,8 +9,17 @@ pub async fn configuration(req_body: String) -> impl Responder {
 
 #[post("/run")]
 pub async fn run(req_body: String) -> impl Responder {
-    // TODO: Use the body id to start the fm
-    HttpResponse::Ok().body(req_body)
+    let grpc_client = VmmClient::new().await;
+
+    match grpc_client {
+        Ok(mut client) => {
+            client.run_vmm().await;
+            HttpResponse::Ok().body(req_body)
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body("Failed to connect to VMM service with error: ".to_string() + &e.to_string()),
+    }
+    
 }
 
 #[get("/logs/{id}")]

@@ -223,4 +223,6 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+kernel/*
+rootfs/*
 # End of https://www.toptal.com/developers/gitignore/api/windows,macos,linux,vim,intellij+all,rust,rust-analyzer,visualstudiocode
